@@ -4,7 +4,7 @@
 #include <MFRC522.h>
 
 // ---------------- WIFI ----------------
-const char* ssid = "Daniel's ESP";
+const char* ssid = "ESP NAME";
 const char* password = "12345678";
 
 WebServer server(80);
@@ -19,10 +19,18 @@ String lastUID = "None";
 String lastData = "No scan yet";
 String lastStatus = "Idle";
 
+// WRITE STATE (IMPORTANT FIX)
 bool writeMode = false;
-String pendingWrite = "";
+String pendingWriteData = "";
+String selectedUID = "";
 
+// timing
 unsigned long lastScanTime = 0;
+
+// ---------------- UID DB ----------------
+#define MAX_UIDS 10
+String recentUIDs[MAX_UIDS];
+int uidIndex = 0;
 
 // ---------------- HELPERS ----------------
 String byteArrayToHex(byte *buffer, byte size) {
@@ -41,13 +49,23 @@ void hexStringToBytes(String hex, byte *output, int len) {
   }
 }
 
+// store UID (for UI only)
+void storeUID(String uid) {
+  for (int i = 0; i < MAX_UIDS; i++) {
+    if (recentUIDs[i] == uid) return;
+  }
+
+  recentUIDs[uidIndex] = uid;
+  uidIndex = (uidIndex + 1) % MAX_UIDS;
+}
+
 // ---------------- WEB PAGE ----------------
 String webpage() {
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 RFID</title>
+  <title>ESP32 RFID System</title>
 </head>
 
 <body>
@@ -59,21 +77,24 @@ String webpage() {
   <h3>Last UID:</h3>
   <p id="uid">---</p>
 
-  <h3>Last Data:</h3>
+  <h3>Last Data (Block 4):</h3>
   <p id="data">---</p>
 
   <hr>
 
-  <h2>WRITE TO CARD</h2>
-
+  <h2>Manual Write (16 bytes = 32 hex chars)</h2>
   <form action="/write">
-    <input name="data" placeholder="32 hex chars (16 bytes)" size="40">
-    <button type="submit">Write</button>
+    <input name="data" placeholder="32 hex chars" size="40">
+    <button type="submit">Write Manual</button>
   </form>
 
-  <p><i>Tap card after pressing write</i></p>
+  <hr>
+
+  <h2>Recent Cards (Click to COPY stored data)</h2>
+  <div id="uids"></div>
 
 <script>
+
 async function update() {
   const res = await fetch('/data');
   const j = await res.json();
@@ -83,8 +104,29 @@ async function update() {
   document.getElementById('data').innerText = j.data;
 }
 
+async function loadUIDs() {
+  const res = await fetch('/uids');
+  const list = await res.json();
+
+  let html = "";
+
+  for (let i = 0; i < list.length; i++) {
+    html += `<p>
+      <a href="/select?uid=${list[i]}">
+        ${list[i]}
+      </a>
+    </p>`;
+  }
+
+  document.getElementById("uids").innerHTML = html;
+}
+
 setInterval(update, 1000);
+setInterval(loadUIDs, 2000);
+
 update();
+loadUIDs();
+
 </script>
 
 </body>
@@ -94,7 +136,7 @@ update();
   return html;
 }
 
-// ---------------- JSON DATA ENDPOINT ----------------
+// ---------------- JSON ----------------
 void handleData() {
   String json = "{";
   json += "\"status\":\"" + lastStatus + "\",";
@@ -105,12 +147,39 @@ void handleData() {
   server.send(200, "application/json", json);
 }
 
-// ---------------- ROOT ----------------
-void handleRoot() {
-  server.send(200, "text/html", webpage());
+// ---------------- UID LIST ----------------
+void handleUIDs() {
+  String json = "[";
+  for (int i = 0; i < MAX_UIDS; i++) {
+    if (recentUIDs[i].length() > 0) {
+      json += "\"" + recentUIDs[i] + "\",";
+    }
+  }
+  json += "]";
+  json.replace(",]", "]");
+
+  server.send(200, "application/json", json);
 }
 
-// ---------------- WRITE REQUEST ----------------
+// ---------------- CLICK UID (FIXED) ----------------
+// Now correctly copies LAST READ BLOCK DATA (NOT UID)
+void handleSelect() {
+  if (!server.hasArg("uid")) return;
+
+  selectedUID = server.arg("uid");
+
+  // FIX: we ONLY copy stored DATA, not UID
+  pendingWriteData = lastData;
+
+  writeMode = true;
+
+  lastStatus = "READY: will COPY stored RFID BLOCK data";
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ---------------- MANUAL WRITE ----------------
 void handleWrite() {
   if (!server.hasArg("data")) {
     lastStatus = "No data provided";
@@ -119,20 +188,27 @@ void handleWrite() {
     return;
   }
 
-  pendingWrite = server.arg("data");
+  String data = server.arg("data");
 
-  if (pendingWrite.length() != 32) {
-    lastStatus = "Must be 32 hex chars";
+  if (data.length() != 32) {
+    lastStatus = "Must be 32 hex chars (16 bytes)";
     server.sendHeader("Location", "/");
     server.send(303);
     return;
   }
 
+  pendingWriteData = data;
   writeMode = true;
-  lastStatus = "Write mode active - tap card";
+
+  lastStatus = "READY: manual write armed";
 
   server.sendHeader("Location", "/");
   server.send(303);
+}
+
+// ---------------- ROOT ----------------
+void handleRoot() {
+  server.send(200, "text/html", webpage());
 }
 
 // ---------------- RFID LOOP ----------------
@@ -141,7 +217,6 @@ void scanRFID() {
   if (!mfrc522.PICC_IsNewCardPresent()) return;
   if (!mfrc522.PICC_ReadCardSerial()) return;
 
-  // debounce
   if (millis() - lastScanTime < 1000) {
     mfrc522.PICC_HaltA();
     return;
@@ -149,8 +224,11 @@ void scanRFID() {
 
   lastScanTime = millis();
 
+  // UID
   lastUID = byteArrayToHex(mfrc522.uid.uidByte, mfrc522.uid.size);
+  storeUID(lastUID);
 
+  // READ BLOCK 4
   byte block = 4;
   byte buffer[18];
   byte size = sizeof(buffer);
@@ -168,7 +246,7 @@ void scanRFID() {
   );
 
   if (status != MFRC522::STATUS_OK) {
-    lastStatus = "Auth failed";
+    lastStatus = "AUTH FAILED";
   } 
   else {
 
@@ -176,26 +254,26 @@ void scanRFID() {
     if (writeMode) {
 
       byte dataBlock[16];
-      hexStringToBytes(pendingWrite, dataBlock, 16);
+      hexStringToBytes(pendingWriteData, dataBlock, 16);
 
       if (mfrc522.MIFARE_Write(block, dataBlock, 16) == MFRC522::STATUS_OK) {
-        lastStatus = "Write SUCCESS!";
-        lastData = pendingWrite;
+        lastStatus = "WRITE SUCCESS";
+        lastData = pendingWriteData;
       } else {
-        lastStatus = "Write FAILED";
+        lastStatus = "WRITE FAILED";
       }
 
       writeMode = false;
-      pendingWrite = "";
+      pendingWriteData = "";
     }
 
     // ---------------- READ ----------------
     else {
       if (mfrc522.MIFARE_Read(block, buffer, &size) == MFRC522::STATUS_OK) {
         lastData = byteArrayToHex(buffer, 16);
-        lastStatus = "Read OK";
+        lastStatus = "READ OK";
       } else {
-        lastStatus = "Read failed";
+        lastStatus = "READ FAILED";
       }
     }
   }
@@ -214,8 +292,10 @@ void setup() {
   WiFi.softAP(ssid, password);
 
   server.on("/", handleRoot);
-  server.on("/write", handleWrite);
   server.on("/data", handleData);
+  server.on("/uids", handleUIDs);
+  server.on("/select", handleSelect);
+  server.on("/write", handleWrite);
 
   server.begin();
 
