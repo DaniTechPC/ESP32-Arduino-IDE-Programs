@@ -1,0 +1,229 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ---------------- WIFI ----------------
+const char* ssid = "Daniel's ESP";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// ---------------- RFID ----------------
+#define SS_PIN 21
+#define RST_PIN 22
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+// ---------------- STATE ----------------
+String lastUID = "None";
+String lastData = "No scan yet";
+String lastStatus = "Idle";
+
+bool writeMode = false;
+String pendingWrite = "";
+
+unsigned long lastScanTime = 0;
+
+// ---------------- HELPERS ----------------
+String byteArrayToHex(byte *buffer, byte size) {
+  String result = "";
+  for (byte i = 0; i < size; i++) {
+    if (buffer[i] < 0x10) result += "0";
+    result += String(buffer[i], HEX);
+  }
+  return result;
+}
+
+void hexStringToBytes(String hex, byte *output, int len) {
+  for (int i = 0; i < len; i++) {
+    String byteString = hex.substring(i * 2, i * 2 + 2);
+    output[i] = (byte) strtol(byteString.c_str(), NULL, 16);
+  }
+}
+
+// ---------------- WEB PAGE ----------------
+String webpage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>ESP32 RFID</title>
+</head>
+
+<body>
+  <h1>ESP32 RFID System</h1>
+
+  <h3>Status:</h3>
+  <p id="status">Loading...</p>
+
+  <h3>Last UID:</h3>
+  <p id="uid">---</p>
+
+  <h3>Last Data:</h3>
+  <p id="data">---</p>
+
+  <hr>
+
+  <h2>WRITE TO CARD</h2>
+
+  <form action="/write">
+    <input name="data" placeholder="32 hex chars (16 bytes)" size="40">
+    <button type="submit">Write</button>
+  </form>
+
+  <p><i>Tap card after pressing write</i></p>
+
+<script>
+async function update() {
+  const res = await fetch('/data');
+  const j = await res.json();
+
+  document.getElementById('status').innerText = j.status;
+  document.getElementById('uid').innerText = j.uid;
+  document.getElementById('data').innerText = j.data;
+}
+
+setInterval(update, 1000);
+update();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+  return html;
+}
+
+// ---------------- JSON DATA ENDPOINT ----------------
+void handleData() {
+  String json = "{";
+  json += "\"status\":\"" + lastStatus + "\",";
+  json += "\"uid\":\"" + lastUID + "\",";
+  json += "\"data\":\"" + lastData + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ---------------- ROOT ----------------
+void handleRoot() {
+  server.send(200, "text/html", webpage());
+}
+
+// ---------------- WRITE REQUEST ----------------
+void handleWrite() {
+  if (!server.hasArg("data")) {
+    lastStatus = "No data provided";
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+
+  pendingWrite = server.arg("data");
+
+  if (pendingWrite.length() != 32) {
+    lastStatus = "Must be 32 hex chars";
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+
+  writeMode = true;
+  lastStatus = "Write mode active - tap card";
+
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ---------------- RFID LOOP ----------------
+void scanRFID() {
+
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+
+  // debounce
+  if (millis() - lastScanTime < 1000) {
+    mfrc522.PICC_HaltA();
+    return;
+  }
+
+  lastScanTime = millis();
+
+  lastUID = byteArrayToHex(mfrc522.uid.uidByte, mfrc522.uid.size);
+
+  byte block = 4;
+  byte buffer[18];
+  byte size = sizeof(buffer);
+
+  MFRC522::MIFARE_Key key;
+  for (byte i = 0; i < 6; i++) key.keyByte[i] = 0xFF;
+
+  MFRC522::StatusCode status;
+
+  status = mfrc522.PCD_Authenticate(
+    MFRC522::PICC_CMD_MF_AUTH_KEY_A,
+    block,
+    &key,
+    &(mfrc522.uid)
+  );
+
+  if (status != MFRC522::STATUS_OK) {
+    lastStatus = "Auth failed";
+  } 
+  else {
+
+    // ---------------- WRITE ----------------
+    if (writeMode) {
+
+      byte dataBlock[16];
+      hexStringToBytes(pendingWrite, dataBlock, 16);
+
+      if (mfrc522.MIFARE_Write(block, dataBlock, 16) == MFRC522::STATUS_OK) {
+        lastStatus = "Write SUCCESS!";
+        lastData = pendingWrite;
+      } else {
+        lastStatus = "Write FAILED";
+      }
+
+      writeMode = false;
+      pendingWrite = "";
+    }
+
+    // ---------------- READ ----------------
+    else {
+      if (mfrc522.MIFARE_Read(block, buffer, &size) == MFRC522::STATUS_OK) {
+        lastData = byteArrayToHex(buffer, 16);
+        lastStatus = "Read OK";
+      } else {
+        lastStatus = "Read failed";
+      }
+    }
+  }
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  WiFi.softAP(ssid, password);
+
+  server.on("/", handleRoot);
+  server.on("/write", handleWrite);
+  server.on("/data", handleData);
+
+  server.begin();
+
+  Serial.println(WiFi.softAPIP());
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  server.handleClient();
+  scanRFID();
+}
